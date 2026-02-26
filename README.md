@@ -34,7 +34,7 @@ TensorRT는 일반 pip 환경에서 설치되지 않을 수 있으므로, NVIDIA
 
 ```python
 import numpy as np
-from derain_tool import maybe_derain
+from derain_tool import deraining
 
 frame = ...  # np.ndarray, shape (H, W, 3) or (N, H, W, 3)
 frame = deraining(frame)
