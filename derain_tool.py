@@ -1,153 +1,78 @@
-from os import path as osp
-from typing import List, Optional, Union
-
 import numpy as np
 import torch
-
 import tensorrt as trt
 import pycuda.driver as cuda
 import pycuda.autoprimaryctx
+from os import path as osp
+from config.cfg import DERAIN_ENGINE, DERAIN_ROI_SIZE
 
-from utils.img_util import img2tensor, tensor2img
+_DERAIN_SINGLETON = None
 
-from config.derain import DERAIN_ENGINE
-
-Frame = np.ndarray
-Frames = Union[List[Frame], np.ndarray]
-_DERAIN_SINGLETON: Optional["DerainTRT"] = None
-
-def deraining(frames: Frames) -> Frames:
-    return _get_singleton().apply_batch(frames)
-
-
-def _get_singleton() -> "DerainTRT":
+def deraining(frames, roi_size=None):
     global _DERAIN_SINGLETON
-    if _DERAIN_SINGLETON is None:
-        _DERAIN_SINGLETON = DerainTRT()
-    return _DERAIN_SINGLETON
-
+    if _DERAIN_SINGLETON is None: _DERAIN_SINGLETON = DerainTRT()
+    return _DERAIN_SINGLETON.apply(frames, roi_size or DERAIN_ROI_SIZE)
 
 class DerainTRT:
-    def __init__(self) -> None:
-        # Engine path comes from config.
-        self.engine_path = DERAIN_ENGINE
-        if not osp.isfile(self.engine_path):
-            raise FileNotFoundError(
-                f"TensorRT engine not found: {self.engine_path}. "
-                "Check config/derain.py (DERAIN_ENGINE)."
-            )
-        self._load_engine(self.engine_path)
-        self._h_input = None
-        self._h_output = None
-        self._d_input = None
-        self._d_output = None
-        self._last_input_shape = None
-        self._last_output_shape = None
-        self._ctx = None
-
-    def _load_engine(self, engine_path: str) -> None:
-        # Load TensorRT engine once.
+    def __init__(self):
         cuda.init()
-        dev = cuda.Device(0)
-        self._ctx = dev.retain_primary_context()
-        self._ctx.push()
+        self.ctx = cuda.Device(0).retain_primary_context()
+        self.ctx.push()
         self.logger = trt.Logger(trt.Logger.ERROR)
-        with open(engine_path, "rb") as f, trt.Runtime(self.logger) as runtime:
-            self.engine = runtime.deserialize_cuda_engine(f.read())
+        with open(DERAIN_ENGINE, "rb") as f, trt.Runtime(self.logger) as r:
+            self.engine = r.deserialize_cuda_engine(f.read())
         self.context = self.engine.create_execution_context()
         self.stream = cuda.Stream()
+        self.buffs = [None] * 4 # h_in, h_out, d_in, d_out
+        self.last_sh = (None, None)
 
-    def apply_batch(self, frames: Frames) -> Frames:
-        if isinstance(frames, list):
-            return [self.apply(f) for f in frames]
-
-        if isinstance(frames, np.ndarray):
-            if frames.ndim == 3:
-                print("im in 3dim!")
-                return self.apply(frames)
-            if frames.ndim == 4:
-                print("im in 4-dim! i can handle batch!")
-                print("frame shape: ", frames.shape)
-                b, h, w, c = frames.shape
-                
-                if c != 3:
-                    raise ValueError(f"Expected 3 channels, got {c}")
-                inp = frames.astype(np.float32) / 255.0
-                print("type 변환된 frame: ", inp.shape)
-                # BGR -> RGB
-                inp = inp[..., ::-1]
-                # NHWC -> NCHW
-                inp = np.transpose(inp, (0, 3, 1, 2))
-                print("transpose 된 frame: ", inp.shape)
-                output = self._infer(inp)
-                if output.ndim == 1:
-                    print("why am i here?")
-                    output = output.reshape((b, 3, h, w))
-                # NCHW -> NHWC, RGB -> BGR, float -> uint8
-                out = np.transpose(output, (0, 2, 3, 1))
-                out = np.clip(out, 0.0, 1.0)
-                out = out[..., ::-1]
-                out = (out * 255.0).round().astype(np.uint8)
-                return out
-
-        raise TypeError(
-            f"Unsupported frames type/shape: {type(frames)} {getattr(frames, 'shape', None)}"
-        )
-
-    def apply(self, frame: Frame) -> Frame:
-        # (h,w,c) = (1024, 1024, 3) -> (c, h, w) = (3, 1024, 1024)
-        inp = img2tensor(frame.astype(np.float32) / 255.0, bgr2rgb=True, float32=True)
-        # (3, 1024, 1024) -> (1, 3, 1024, 1024)
-        inp_np = inp.unsqueeze(dim=0).numpy()
-        # Run TRT inference
-        output_flat = self._infer(inp_np)
-
-        h, w = frame.shape[:2]
-        if output_flat.ndim == 1:
-            out = output_flat.reshape((1, 3, h, w))
+    def apply(self, frames, roi_size=None):
+        is_arr = isinstance(frames, np.ndarray)
+        f_list = [frames] if (is_arr and frames.ndim == 3) else list(frames)
+        
+        if roi_size:
+            out_fs = [f.copy() for f in f_list]
+            crops, meta = [], []
+            for i, f in enumerate(f_list):
+                h, w = f.shape[:2]
+                s = min(roi_size, h, w)
+                x, y = (w-s)//2, (h-s)//2
+                crops.append(f[y:y+s, x:x+s])
+                meta.append((i, x, y, s))
+            
+            denoised = self._infer_batch(np.stack(crops))
+            for d, (i, x, y, s) in zip(denoised, meta):
+                out_fs[i][y:y+s, x:x+s] = d
+            res = out_fs
         else:
-            out = output_flat
-        # CHW -> HWC uint8.
-        denoised_roi = tensor2img([torch.from_numpy(out)])
-        return denoised_roi
+            res = self._infer_batch(np.stack(f_list))
 
-    def _infer(self, img: np.ndarray) -> np.ndarray:
-        input_name = self.engine.get_tensor_name(0)
-        output_name = self.engine.get_tensor_name(1)
-        input_dtype = trt.nptype(self.engine.get_tensor_dtype(input_name))
-        output_dtype = trt.nptype(self.engine.get_tensor_dtype(output_name))
+        return np.stack(res) if (is_arr and frames.ndim == 4) else (res[0] if is_arr else res)
 
-        self.context.set_input_shape(input_name, img.shape)
-        output_shape = tuple(self.context.get_tensor_shape(output_name))
+    def _infer_batch(self, batch):
+        # Pre-process: BGR->RGB, NHWC->NCHW, Normalize
+        x = (batch[..., ::-1].transpose(0, 3, 1, 2) / 255.0).astype(np.float32)
+        
+        i_nm, o_nm = self.engine.get_tensor_name(0), self.engine.get_tensor_name(1)
+        self.context.set_input_shape(i_nm, x.shape)
+        o_sh = tuple(self.context.get_tensor_shape(o_nm))
 
-        # Allocate host/device buffers once and reuse (realloc if shape changes).
-        if (self._h_input is None or
-                self._last_input_shape != img.shape or
-                self._last_output_shape != output_shape):
-            self._h_input = cuda.pagelocked_empty(
-                trt.volume(img.shape), dtype=input_dtype
-            )
-            self._h_output = cuda.pagelocked_empty(
-                trt.volume(output_shape), dtype=output_dtype
-            )
-            self._d_input = cuda.mem_alloc(self._h_input.nbytes)
-            self._d_output = cuda.mem_alloc(self._h_output.nbytes)
-            self._last_input_shape = img.shape
-            self._last_output_shape = output_shape
+        if self.last_sh != (x.shape, o_sh):
+            self.buffs[0] = cuda.pagelocked_empty(x.size, np.float32)
+            self.buffs[1] = cuda.pagelocked_empty(trt.volume(o_sh), np.float32)
+            self.buffs[2] = cuda.mem_alloc(self.buffs[0].nbytes)
+            self.buffs[3] = cuda.mem_alloc(self.buffs[1].nbytes)
+            self.last_sh = (x.shape, o_sh)
 
-        if img.dtype != input_dtype:
-            img = img.astype(input_dtype, copy=False)
-        np.copyto(self._h_input, img.ravel())
+        np.copyto(self.buffs[0], x.ravel())
+        self.context.set_tensor_address(i_nm, self.buffs[2])
+        self.context.set_tensor_address(o_nm, self.buffs[3])
 
-        self.context.set_tensor_address(input_name, self._d_input)
-        self.context.set_tensor_address(output_name, self._d_output)
-
-        cuda.memcpy_htod_async(self._d_input, self._h_input, self.stream)
-        ok = self.context.execute_async_v3(stream_handle=self.stream.handle)
-        if ok is False:
-            raise RuntimeError(
-                "TensorRT execution failed (execute_async_v3 returned False)."
-            )
-        cuda.memcpy_dtoh_async(self._h_output, self._d_output, self.stream)
+        cuda.memcpy_htod_async(self.buffs[2], self.buffs[0], self.stream)
+        self.context.execute_async_v3(self.stream.handle)
+        cuda.memcpy_dtoh_async(self.buffs[1], self.buffs[3], self.stream)
         self.stream.synchronize()
-        return self._h_output.reshape(output_shape)
+
+        # Post-process: NCHW->NHWC, RGB->BGR, Denormalize
+        out = self.buffs[1].reshape(o_sh).transpose(0, 2, 3, 1)
+        return (np.clip(out, 0, 1)[..., ::-1] * 255).round().astype(np.uint8)
