@@ -12,8 +12,8 @@
 ## 실행 환경
 - Python 3.10 
 - NVIDIA GPU
-- CUDA 12.8
-- TensorRT 10.15.1
+- CUDA 12.4
+- TensorRT 10.1.0
 
 ## 설치
 ```bash
